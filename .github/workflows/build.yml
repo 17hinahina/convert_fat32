@@ -25,6 +25,10 @@ jobs:
         shell: pwsh
         run: go vet main.go
 
+      - name: exFAT to FAT32 stress test
+        shell: pwsh
+        run: python tests/stress_exfat_to_fat32.py --loops 100000
+
       - name: Build
         shell: pwsh
         run: go build -trimpath -ldflags="-s -w" -o FAT32SSDFormatter_console_v0.2.1.exe main.go
