@@ -76,8 +76,12 @@ v0.2.1では以下を確認しています。
 - 1 GiB / 64 GiB / 約1.896 TB / 2 TBのFAT32イメージ認識: PASS
 - 2 TB・4096-byte logical sectorのイメージ認識: PASS
 - v0.2.0で失敗していた約1.896 TBケースの回帰テスト: PASS
+- exFAT → FAT32変換ストレス: **256GB / 512GB / 1TB / 2TBを各200,000回 PASS**（100,000回×2実行、合計800,000回）
+- 上記4容量のスパースイメージを `blkid` で変換前 `exFAT`、変換後 `FAT32/vfat` と認識: PASS
 
-詳細は [`TEST_REPORT.md`](TEST_REPORT.md) を参照してください。
+ストレステストでは512 / 1024 / 2048 / 4096-byte logical sectorと、各容量で成立するAuto / 4 / 8 / 16 / 32 / 64 KiB clusterモードを組み合わせています。2TBでは4 KiB clusterはFAT32の最大クラスタ数を超えるため、プログラム仕様どおり拒否対象です。Auto（32 KiB）および8 / 16 / 32 / 64 KiBはPASSしています。
+
+詳細は [`TEST_REPORT.md`](TEST_REPORT.md) を参照してください。再実行用テストは [`tests/stress_exfat_to_fat32.py`](tests/stress_exfat_to_fat32.py) にあります。
 
 Windows実機でのUAC・ボリュームロック・ディスマウント・raw writeを伴う破壊的統合テストは、このLinuxテスト環境では実行していません。最初は空のUSBメモリやVHD/VHDX等で確認してください。
 
@@ -91,7 +95,8 @@ FAT32 BPBのTotal Sectorsフィールドは32-bitです。512-byte logical secto
 
 - `main.go` — formatter source
 - `TEST_REPORT.md` — v0.2.1 test report
-- `.github/workflows/build.yml` — Windows x64 build workflow
+- `tests/stress_exfat_to_fat32.py` — exFAT → FAT32 stress/regression test
+- `.github/workflows/build.yml` — Windows x64 build + stress-test workflow
 
 ## Disclaimer
 
