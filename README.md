@@ -28,16 +28,138 @@ v0.2.0で特定容量に発生していたFATサイズ計算の振動問題を�
 
 ## Usage
 
-1. FAT32化するSSD / USBストレージにドライブレターを割り当てます。
-2. `FAT32SSDFormatter_console_v0.2.1.exe` を実行します。
-3. UACを許可します。
-4. 一覧から対象ドライブを選択します。
-5. ボリュームラベルを入力します。
-6. クラスタサイズを選択します。通常は `Auto` で構いません。
-7. 表示された `FORMAT X:` を正確に入力します。
-8. 最終確認として `YES` を入力するとフォーマットを開始します。
+### 事前準備
 
-大容量ドライブではAuto選択時に32 KiBクラスタを使用します。
+1. FAT32化するSSD / USBストレージをPCへ接続します。
+2. エクスプローラーで対象ドライブに `D:` や `E:` などのドライブレターが付いていることを確認します。
+3. 必要なデータをすべて別の場所へバックアップします。
+4. 対象ドライブを使用しているアプリやエクスプローラーのウィンドウを閉じます。
+
+> [!CAUTION]
+> このツールはexFAT / NTFS等のデータを保持したままFAT32へ変換するツールではありません。対象ボリュームを消去し、FAT32として新しく作り直します。
+
+### 1. EXEを起動
+
+`FAT32SSDFormatter_console_v0.2.1.exe` をダブルクリックして起動します。
+
+管理者権限がない場合は自動的にUAC昇格を要求します。Windowsの確認画面が表示されたら許可してください。昇格に失敗する場合は、EXEを右クリックして **「管理者として実行」** を選択します。
+
+### 2. 対象ドライブを選ぶ
+
+起動すると、フォーマット可能な固定 / リムーバブルボリュームが表示されます。Windowsが起動しているシステムドライブは一覧から除外されます。
+
+表示例:
+
+```text
+Available target volumes:
+  1) E:  476.94 GiB  FS=exFAT     512 B/sector  MUSICSSD
+  2) F:  238.47 GiB  FS=NTFS      512 B/sector  BACKUP
+
+Select target [1-2]:
+```
+
+FAT32にするドライブの番号を入力してEnterを押します。
+
+容量・現在のファイルシステム・ドライブレターを必ず確認してください。
+
+### 3. ボリュームラベルを入力
+
+```text
+Volume label [FAT32SSD]:
+```
+
+そのままEnterを押すと `FAT32SSD` になります。
+
+ラベルはFAT32互換のため最大11文字相当で、英大文字・数字・スペース・`_`・`-` が使用できます。小文字は大文字へ変換され、使用できない文字は除外されます。
+
+### 4. クラスタサイズを選択
+
+```text
+Cluster size:  1) Auto  2) 4KB  3) 8KB  4) 16KB  5) 32KB  6) 64KB
+Select [1]:
+```
+
+通常は何も入力せずEnter、または `1` を入力して **Auto** を使用してください。
+
+大容量SSDではAutoは32 KiBを選択します。256GB / 512GB / 1TB / 2TBでは基本的にAutoを推奨します。
+
+2TBでは4 KiBクラスタはFAT32の最大クラスタ数を超えるため使用できません。Auto（32 KiB）または8 / 16 / 32 / 64 KiBを使用してください。
+
+### 5. 対象を最終確認
+
+フォーマット直前に次のような内容が表示されます。
+
+```text
+WARNING: ALL DATA ON THE SELECTED VOLUME WILL BE ERASED.
+Target : E:
+Size   : 476.94 GiB (...)
+Current: exFAT
+Label  : FAT32SSD
+Type exactly 'FORMAT E:' to continue:
+```
+
+表示された文字列を**完全に同じ内容で**入力します。Eドライブなら:
+
+```text
+FORMAT E:
+```
+
+続いて:
+
+```text
+Final confirmation - type YES:
+```
+
+に対して、実行する場合のみ:
+
+```text
+YES
+```
+
+と入力します。どちらかが一致しなければ処理はキャンセルされます。
+
+### 6. フォーマット実行
+
+確認後、ボリュームをロック・ディスマウントしてFAT32構造を書き込みます。処理中はSSDを取り外したりPCの電源を切ったりしないでください。
+
+主な処理は以下です。
+
+- FAT32 Boot Sector / BPB作成
+- FSInfo作成
+- Backup Boot Sector / Backup FSInfo作成
+- FAT #1 / FAT #2初期化
+- Root Directory作成
+- MBRの場合は可能ならpartition typeをFAT32 LBA `0x0C`へ変更
+
+完了すると次のように表示されます。
+
+```text
+[100%] Completed.
+
+E: was formatted as FAT32 successfully.
+```
+
+### 7. 完了後
+
+エクスプローラーへすぐ反映されない場合は、外付けSSD / USBストレージを安全に取り外して接続し直すか、「ディスクの管理」でディスクの再スキャンを行ってください。
+
+Windowsのドライブのプロパティで **ファイルシステム: FAT32** になっていることを確認します。
+
+### exFATからFAT32へ変更する場合の最短手順
+
+```text
+1. exFATのSSDを接続
+2. EXEを起動してUACを許可
+3. FS=exFAT と表示されている対象ドライブを選択
+4. Volume labelを入力
+5. Cluster sizeはAuto
+6. FORMAT X: を入力
+7. YES を入力
+8. Completed. が出るまで待つ
+9. SSDを再接続してFAT32になっていることを確認
+```
+
+**exFAT上の既存ファイルはすべて消去されます。**
 
 ## Important behavior
 
