@@ -1,0 +1,40 @@
+name: Build Windows x64
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+
+      - name: Vet
+        shell: pwsh
+        run: go vet main.go
+
+      - name: Build
+        shell: pwsh
+        run: go build -trimpath -ldflags="-s -w" -o FAT32SSDFormatter_console_v0.2.1.exe main.go
+
+      - name: SHA-256
+        shell: pwsh
+        run: Get-FileHash .\FAT32SSDFormatter_console_v0.2.1.exe -Algorithm SHA256
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: FAT32SSDFormatter_console_v0.2.1_windows_x64
+          path: FAT32SSDFormatter_console_v0.2.1.exe
