@@ -1,0 +1,2 @@
+# convert_fat32
+最大2TBのSSDをfat32にフォーマット
