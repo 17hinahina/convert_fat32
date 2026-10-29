@@ -27,11 +27,6 @@ const (
 	fileFlagWriteThrough = 0x80000000
 	fileFlagNoBuffering  = 0x20000000
 
-	memCommit   = 0x00001000
-	memReserve  = 0x00002000
-	memRelease  = 0x00008000
-	pageReadWrite = 0x04
-
 	driveRemovable = 2
 	driveFixed     = 3
 
@@ -67,8 +62,6 @@ var (
 	procGetDiskFreeSpaceExW   = kernel32.NewProc("GetDiskFreeSpaceExW")
 	procGetDiskFreeSpaceW     = kernel32.NewProc("GetDiskFreeSpaceW")
 	procGetVolumeInformationW = kernel32.NewProc("GetVolumeInformationW")
-	procVirtualAlloc          = kernel32.NewProc("VirtualAlloc")
-	procVirtualFree           = kernel32.NewProc("VirtualFree")
 
 	procIsUserAnAdmin = shell32.NewProc("IsUserAnAdmin")
 	procShellExecuteW = shell32.NewProc("ShellExecuteW")
@@ -161,10 +154,9 @@ func setFilePointer(h handle, offset uint64) error {
 	return nil
 }
 
-// writeAll copies data into VirtualAlloc memory before WriteFile. Volume handles can be
-// opened as non-cached even when the caller did not request it, and Windows therefore
-// requires raw-I/O buffers to be aligned to the physical sector size. VirtualAlloc returns
-// page-aligned memory (at least 4096 bytes on x64), covering normal 512e/4Kn media.
+// writeAll uses a 64 KiB-aligned Go buffer. Windows volume handles may be non-cached,
+// so raw I/O buffers must obey physical-sector alignment. 64 KiB is a multiple of all
+// supported power-of-two physical sector sizes up to 64 KiB.
 func writeAll(h handle, offset uint64, data []byte) error {
 	if len(data) == 0 {
 		return nil
@@ -173,13 +165,11 @@ func writeAll(h handle, offset uint64, data []byte) error {
 		return fmt.Errorf("seek to offset=%d (0x%X): %w", offset, offset, err)
 	}
 
-	p, _, e := procVirtualAlloc.Call(0, uintptr(len(data)), memCommit|memReserve, pageReadWrite)
-	if p == 0 {
-		return winErr(fmt.Sprintf("VirtualAlloc failed for %d-byte raw I/O buffer", len(data)), e)
-	}
-	defer procVirtualFree.Call(p, 0, memRelease)
-
-	buf := unsafe.Slice((*byte)(unsafe.Pointer(p)), len(data))
+	const alignment = uintptr(64 * 1024)
+	raw := make([]byte, len(data)+int(alignment))
+	base := uintptr(unsafe.Pointer(&raw[0]))
+	delta := int((alignment - (base % alignment)) % alignment)
+	buf := raw[delta : delta+len(data)]
 	copy(buf, data)
 
 	var lastErr error
@@ -187,16 +177,16 @@ func writeAll(h handle, offset uint64, data []byte) error {
 		var written uint32
 		r, _, we := procWriteFile.Call(
 			uintptr(h),
-			p,
-			uintptr(len(data)),
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(len(buf)),
 			uintptr(unsafe.Pointer(&written)),
 			0,
 		)
 		if r != 0 {
-			if written == uint32(len(data)) {
+			if written == uint32(len(buf)) {
 				return nil
 			}
-			return fmt.Errorf("WriteFile short write at offset=%d (0x%X), request=%d bytes, written=%d", offset, offset, len(data), written)
+			return fmt.Errorf("WriteFile short write at offset=%d (0x%X), request=%d bytes, written=%d", offset, offset, len(buf), written)
 		}
 		lastErr = we
 		if we != syscall.Errno(21) || attempt == 4 {
@@ -204,7 +194,7 @@ func writeAll(h handle, offset uint64, data []byte) error {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return fmt.Errorf("WriteFile failed at offset=%d (0x%X), request=%d bytes: %w", offset, offset, len(data), lastErr)
+	return fmt.Errorf("WriteFile failed at offset=%d (0x%X), request=%d bytes: %w", offset, offset, len(buf), lastErr)
 }
 
 func flush(h handle) error {
