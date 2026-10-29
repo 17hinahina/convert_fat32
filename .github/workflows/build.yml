@@ -15,24 +15,42 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.23.x'
+
       - name: Vet
         shell: pwsh
         run: go vet main.go
+
       - name: exFAT to FAT32 stress test
         shell: pwsh
         run: python tests/stress_exfat_to_fat32.py --loops 100000
+
       - name: Build
         shell: pwsh
         run: go build -trimpath -ldflags="-s -w" -o FAT32SSDFormatter_console_v0.2.4.exe main.go
+
       - name: SHA-256
         shell: pwsh
         run: Get-FileHash .\FAT32SSDFormatter_console_v0.2.4.exe -Algorithm SHA256
+
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
           name: FAT32SSDFormatter_console_v0.2.4_windows_x64
           path: FAT32SSDFormatter_console_v0.2.4.exe
+
+      - name: Commit executable to repository
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add FAT32SSDFormatter_console_v0.2.4.exe
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+          git commit -m "chore: add Windows executable v0.2.4 [skip ci]"
+          git push origin HEAD:main
