@@ -1,4 +1,4 @@
-// FAT32 SSD Formatter Console v0.2.3
+// FAT32 SSD Formatter Console v0.2.4
 // Windows x64 console utility. Destructive: formats an existing mounted volume as FAT32.
 package main
 
@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	version = "0.2.3"
+	version = "0.2.4"
 
 	genericRead          = 0x80000000
 	genericWrite         = 0x40000000
@@ -25,6 +25,12 @@ const (
 	shareWrite           = 0x00000002
 	openExisting         = 3
 	fileFlagWriteThrough = 0x80000000
+	fileFlagNoBuffering  = 0x20000000
+
+	memCommit   = 0x00001000
+	memReserve  = 0x00002000
+	memRelease  = 0x00008000
+	pageReadWrite = 0x04
 
 	driveRemovable = 2
 	driveFixed     = 3
@@ -36,6 +42,7 @@ const (
 	fsctlLockVolume             = 0x00090018
 	fsctlUnlockVolume           = 0x0009001C
 	fsctlDismountVolume         = 0x00090020
+	fsctlAllowExtendedDasdIO    = 0x00090083
 
 	reservedSectors  = uint32(32)
 	numberOfFATs     = uint32(2)
@@ -60,6 +67,8 @@ var (
 	procGetDiskFreeSpaceExW   = kernel32.NewProc("GetDiskFreeSpaceExW")
 	procGetDiskFreeSpaceW     = kernel32.NewProc("GetDiskFreeSpaceW")
 	procGetVolumeInformationW = kernel32.NewProc("GetVolumeInformationW")
+	procVirtualAlloc          = kernel32.NewProc("VirtualAlloc")
+	procVirtualFree           = kernel32.NewProc("VirtualFree")
 
 	procIsUserAnAdmin = shell32.NewProc("IsUserAnAdmin")
 	procShellExecuteW = shell32.NewProc("ShellExecuteW")
@@ -152,43 +161,50 @@ func setFilePointer(h handle, offset uint64) error {
 	return nil
 }
 
+// writeAll copies data into VirtualAlloc memory before WriteFile. Volume handles can be
+// opened as non-cached even when the caller did not request it, and Windows therefore
+// requires raw-I/O buffers to be aligned to the physical sector size. VirtualAlloc returns
+// page-aligned memory (at least 4096 bytes on x64), covering normal 512e/4Kn media.
 func writeAll(h handle, offset uint64, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
 	if err := setFilePointer(h, offset); err != nil {
 		return fmt.Errorf("seek to offset=%d (0x%X): %w", offset, offset, err)
 	}
-	done := 0
-	for done < len(data) {
-		remaining := len(data) - done
-		absoluteOffset := offset + uint64(done)
-		var written uint32
-		var r uintptr
-		var e error
-		for attempt := 0; attempt < 5; attempt++ {
-			r, _, e = procWriteFile.Call(
-				uintptr(h),
-				uintptr(unsafe.Pointer(&data[done])),
-				uintptr(remaining),
-				uintptr(unsafe.Pointer(&written)),
-				0,
-			)
-			if r != 0 {
-				break
-			}
-			// Some USB storage bridges briefly report ERROR_NOT_READY (21).
-			if e != syscall.Errno(21) || attempt == 4 {
-				break
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
-		if r == 0 {
-			return fmt.Errorf("WriteFile failed at offset=%d (0x%X), request=%d bytes, written=%d: %w", absoluteOffset, absoluteOffset, remaining, written, e)
-		}
-		if written == 0 {
-			return fmt.Errorf("WriteFile returned zero bytes at offset=%d (0x%X), request=%d bytes", absoluteOffset, absoluteOffset, remaining)
-		}
-		done += int(written)
+
+	p, _, e := procVirtualAlloc.Call(0, uintptr(len(data)), memCommit|memReserve, pageReadWrite)
+	if p == 0 {
+		return winErr(fmt.Sprintf("VirtualAlloc failed for %d-byte raw I/O buffer", len(data)), e)
 	}
-	return nil
+	defer procVirtualFree.Call(p, 0, memRelease)
+
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(p)), len(data))
+	copy(buf, data)
+
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		var written uint32
+		r, _, we := procWriteFile.Call(
+			uintptr(h),
+			p,
+			uintptr(len(data)),
+			uintptr(unsafe.Pointer(&written)),
+			0,
+		)
+		if r != 0 {
+			if written == uint32(len(data)) {
+				return nil
+			}
+			return fmt.Errorf("WriteFile short write at offset=%d (0x%X), request=%d bytes, written=%d", offset, offset, len(data), written)
+		}
+		lastErr = we
+		if we != syscall.Errno(21) || attempt == 4 {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("WriteFile failed at offset=%d (0x%X), request=%d bytes: %w", offset, offset, len(data), lastErr)
 }
 
 func flush(h handle) error {
@@ -476,8 +492,9 @@ func formatFAT32(opt formatOptions) error {
 		return errors.New("refusing to format the Windows system drive")
 	}
 
-	// Write-through avoids relying on FlushFileBuffers after the volume has been dismounted.
-	h, err := createFileWithFlags(volumePath(opt.letter), genericRead|genericWrite, fileFlagWriteThrough)
+	// Make raw-I/O behavior deterministic. Volume handles may be non-cached anyway,
+	// so explicitly request NO_BUFFERING and satisfy its alignment requirements.
+	h, err := createFileWithFlags(volumePath(opt.letter), genericRead|genericWrite, fileFlagWriteThrough|fileFlagNoBuffering)
 	if err != nil {
 		return fmt.Errorf("cannot open target volume for writing (run as Administrator): %w", err)
 	}
@@ -504,8 +521,10 @@ func formatFAT32(opt formatOptions) error {
 	binary.LittleEndian.PutUint32(query[0:4], 6)
 	align := make([]byte, 32)
 	var bps uint32
+	var physicalBps uint32
 	if err := deviceIoControl(h, ioctlStorageQueryProperty, query, align); err == nil {
 		bps = binary.LittleEndian.Uint32(align[16:20])
+		physicalBps = binary.LittleEndian.Uint32(align[20:24])
 	}
 	if bps == 0 {
 		var spc0, bps0, freeClusters, totalClusters uint32
@@ -520,6 +539,13 @@ func formatFAT32(opt formatOptions) error {
 	}
 	if !isPowerOfTwo(bps) || bps < 512 || bps > 4096 {
 		return fmt.Errorf("unsupported logical sector size: %d (supported 512/1024/2048/4096)", bps)
+	}
+	if physicalBps == 0 {
+		physicalBps = bps
+	}
+	fmt.Printf("       Logical sector: %d bytes, physical sector: %d bytes\n", bps, physicalBps)
+	if physicalBps > 64*1024 || !isPowerOfTwo(physicalBps) {
+		return fmt.Errorf("unsupported physical sector size: %d", physicalBps)
 	}
 
 	totalSectors64 := volumeBytes / uint64(bps)
@@ -608,14 +634,11 @@ func formatFAT32(opt formatOptions) error {
 	rootOffset := dataOffset
 	rootBytes := uint64(spc) * uint64(bps)
 
-	// Flush the old filesystem while it is still mounted, then dismount before raw writes.
-	fmt.Printf("[  2%%] Flushing current filesystem...\n")
-	if err := flush(h); err != nil {
-		return fmt.Errorf("could not flush current filesystem before dismount: %w", err)
-	}
-	fmt.Printf("[  3%%] Dismounting current filesystem...\n")
-	if err := deviceIoControl(h, fsctlDismountVolume, nil, nil); err != nil {
-		return fmt.Errorf("cannot dismount locked volume before raw format: %w", err)
+	// FSCTL_LOCK_VOLUME already flushes cached file-system data. Keep the volume locked
+	// during the raw format, then dismount only after the new FAT32 structures are complete.
+	fmt.Printf("[  3%%] Enabling extended raw-volume I/O...\n")
+	if err := deviceIoControl(h, fsctlAllowExtendedDasdIO, nil, nil); err != nil {
+		return fmt.Errorf("cannot enable FSCTL_ALLOW_EXTENDED_DASD_IO: %w", err)
 	}
 
 	if err := zeroRange(h, 0, uint64(reservedSectors)*uint64(bps), 4, 7, "Clearing reserved area..."); err != nil {
@@ -673,6 +696,10 @@ func formatFAT32(opt formatOptions) error {
 		_ = deviceIoControl(h, ioctlDiskSetPartitionInfo, []byte{0x0C}, nil)
 	}
 
+	fmt.Printf("[ 96%%] Dismounting newly formatted volume...\n")
+	if err := deviceIoControl(h, fsctlDismountVolume, nil, nil); err != nil {
+		return fmt.Errorf("cannot dismount newly formatted volume: %w", err)
+	}
 	fmt.Printf("[ 98%%] Releasing volume...\n")
 	_ = deviceIoControl(h, fsctlUnlockVolume, nil, nil)
 	locked = false
