@@ -1,4 +1,4 @@
-// FAT32 SSD Formatter Console v0.2.2
+// FAT32 SSD Formatter Console v0.2.3
 // Windows x64 console utility. Destructive: formats an existing mounted volume as FAT32.
 package main
 
@@ -17,13 +17,14 @@ import (
 )
 
 const (
-	version = "0.2.2"
+	version = "0.2.3"
 
-	genericRead  = 0x80000000
-	genericWrite = 0x40000000
-	shareRead    = 0x00000001
-	shareWrite   = 0x00000002
-	openExisting = 3
+	genericRead          = 0x80000000
+	genericWrite         = 0x40000000
+	shareRead            = 0x00000001
+	shareWrite           = 0x00000002
+	openExisting         = 3
+	fileFlagWriteThrough = 0x80000000
 
 	driveRemovable = 2
 	driveFixed     = 3
@@ -94,14 +95,14 @@ func winErr(prefix string, e error) error {
 	return fmt.Errorf("%s: %v", prefix, e)
 }
 
-func createFile(path string, access uint32) (handle, error) {
+func createFileWithFlags(path string, access uint32, flags uint32) (handle, error) {
 	r, _, e := procCreateFileW.Call(
 		uintptr(unsafe.Pointer(utf16Ptr(path))),
 		uintptr(access),
 		uintptr(shareRead|shareWrite),
 		0,
 		uintptr(openExisting),
-		0,
+		uintptr(flags),
 		0,
 	)
 	h := handle(r)
@@ -109,6 +110,10 @@ func createFile(path string, access uint32) (handle, error) {
 		return h, winErr("CreateFileW failed", e)
 	}
 	return h, nil
+}
+
+func createFile(path string, access uint32) (handle, error) {
+	return createFileWithFlags(path, access, 0)
 }
 
 func closeHandle(h handle) {
@@ -149,20 +154,37 @@ func setFilePointer(h handle, offset uint64) error {
 
 func writeAll(h handle, offset uint64, data []byte) error {
 	if err := setFilePointer(h, offset); err != nil {
-		return err
+		return fmt.Errorf("seek to offset=%d (0x%X): %w", offset, offset, err)
 	}
 	done := 0
 	for done < len(data) {
+		remaining := len(data) - done
+		absoluteOffset := offset + uint64(done)
 		var written uint32
-		r, _, e := procWriteFile.Call(
-			uintptr(h),
-			uintptr(unsafe.Pointer(&data[done])),
-			uintptr(len(data)-done),
-			uintptr(unsafe.Pointer(&written)),
-			0,
-		)
-		if r == 0 || written == 0 {
-			return winErr("WriteFile failed", e)
+		var r uintptr
+		var e error
+		for attempt := 0; attempt < 5; attempt++ {
+			r, _, e = procWriteFile.Call(
+				uintptr(h),
+				uintptr(unsafe.Pointer(&data[done])),
+				uintptr(remaining),
+				uintptr(unsafe.Pointer(&written)),
+				0,
+			)
+			if r != 0 {
+				break
+			}
+			// Some USB storage bridges briefly report ERROR_NOT_READY (21).
+			if e != syscall.Errno(21) || attempt == 4 {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if r == 0 {
+			return fmt.Errorf("WriteFile failed at offset=%d (0x%X), request=%d bytes, written=%d: %w", absoluteOffset, absoluteOffset, remaining, written, e)
+		}
+		if written == 0 {
+			return fmt.Errorf("WriteFile returned zero bytes at offset=%d (0x%X), request=%d bytes", absoluteOffset, absoluteOffset, remaining)
 		}
 		done += int(written)
 	}
@@ -177,8 +199,6 @@ func flush(h handle) error {
 			return nil
 		}
 		lastErr = e
-		// ERROR_NOT_READY (21) can be transient with some USB/SATA/NVMe bridges.
-		// Retry only that error; all other flush failures remain fatal.
 		if e != syscall.Errno(21) {
 			return winErr("FlushFileBuffers failed", e)
 		}
@@ -274,7 +294,6 @@ func queryVolume(letter byte) (volumeInfo, error) {
 	}
 	vi.totalBytes = binary.LittleEndian.Uint64(outLen)
 
-	// STORAGE_PROPERTY_QUERY: PropertyId=StorageAccessAlignmentProperty(6), QueryType=PropertyStandardQuery(0)
 	query := make([]byte, 12)
 	binary.LittleEndian.PutUint32(query[0:4], 6)
 	align := make([]byte, 32)
@@ -363,9 +382,6 @@ func autoClusterBytes(bytes uint64, bps uint32) uint32 {
 }
 
 func computeFatSectors(totalSectors uint32, bps uint32, spc uint32) (uint32, uint64, error) {
-	// Grow the FAT monotonically until it is large enough for the cluster count.
-	// Requiring exact equality can oscillate between N and N+1 sectors for some
-	// volume sizes because changing the FAT size also changes the data-cluster count.
 	fatSectors := uint32(1)
 	for i := 0; i < 64; i++ {
 		used := uint64(reservedSectors) + uint64(numberOfFATs)*uint64(fatSectors)
@@ -437,7 +453,7 @@ func zeroRange(h handle, offset, bytes uint64, startPct, endPct int, stage strin
 			n = bytes - done
 		}
 		if err := writeAll(h, offset+done, zeros[:int(n)]); err != nil {
-			return err
+			return fmt.Errorf("%s: %w", stage, err)
 		}
 		done += n
 		pct := startPct
@@ -460,7 +476,8 @@ func formatFAT32(opt formatOptions) error {
 		return errors.New("refusing to format the Windows system drive")
 	}
 
-	h, err := createFile(volumePath(opt.letter), genericRead|genericWrite)
+	// Write-through avoids relying on FlushFileBuffers after the volume has been dismounted.
+	h, err := createFileWithFlags(volumePath(opt.letter), genericRead|genericWrite, fileFlagWriteThrough)
 	if err != nil {
 		return fmt.Errorf("cannot open target volume for writing (run as Administrator): %w", err)
 	}
@@ -511,10 +528,8 @@ func formatFAT32(opt formatOptions) error {
 	}
 	totalSectors := uint32(totalSectors64)
 
-	// PARTITION_INFORMATION_EX starts with PARTITION_STYLE (DWORD), then 4 bytes padding,
-	// then StartingOffset (LARGE_INTEGER). This gives BPB_HiddSec for both MBR and GPT.
 	hidden := uint32(0)
-	partitionStyle := uint32(2) // PARTITION_STYLE_RAW fallback
+	partitionStyle := uint32(2)
 	partInfoEx := make([]byte, 144)
 	if err := deviceIoControl(h, ioctlDiskGetPartitionInfoEx, nil, partInfoEx); err == nil {
 		partitionStyle = binary.LittleEndian.Uint32(partInfoEx[0:4])
@@ -593,23 +608,31 @@ func formatFAT32(opt formatOptions) error {
 	rootOffset := dataOffset
 	rootBytes := uint64(spc) * uint64(bps)
 
-	// The volume stays locked but mounted while the raw FAT32 structures are written.
-	// Microsoft documents the sequence as Open -> Lock -> Format -> Dismount -> Unlock -> Close.
-	if err := zeroRange(h, 0, uint64(reservedSectors)*uint64(bps), 3, 6, "Clearing reserved area..."); err != nil {
+	// Flush the old filesystem while it is still mounted, then dismount before raw writes.
+	fmt.Printf("[  2%%] Flushing current filesystem...\n")
+	if err := flush(h); err != nil {
+		return fmt.Errorf("could not flush current filesystem before dismount: %w", err)
+	}
+	fmt.Printf("[  3%%] Dismounting current filesystem...\n")
+	if err := deviceIoControl(h, fsctlDismountVolume, nil, nil); err != nil {
+		return fmt.Errorf("cannot dismount locked volume before raw format: %w", err)
+	}
+
+	if err := zeroRange(h, 0, uint64(reservedSectors)*uint64(bps), 4, 7, "Clearing reserved area..."); err != nil {
 		return err
 	}
 	fmt.Println()
 	if err := writeAll(h, 0, boot); err != nil {
-		return err
+		return fmt.Errorf("writing primary boot sector: %w", err)
 	}
 	if err := writeAll(h, uint64(1)*uint64(bps), fsinfo); err != nil {
-		return err
+		return fmt.Errorf("writing primary FSInfo: %w", err)
 	}
 	if err := writeAll(h, uint64(6)*uint64(bps), boot); err != nil {
-		return err
+		return fmt.Errorf("writing backup boot sector: %w", err)
 	}
 	if err := writeAll(h, uint64(7)*uint64(bps), fsinfo); err != nil {
-		return err
+		return fmt.Errorf("writing backup FSInfo: %w", err)
 	}
 
 	if err := zeroRange(h, fat1Offset, fatBytes, 8, 48, "Initializing FAT 1..."); err != nil {
@@ -626,10 +649,10 @@ func formatFAT32(opt formatOptions) error {
 	put32(firstFATSector, 4, 0x0FFFFFFF)
 	put32(firstFATSector, 8, 0x0FFFFFFF)
 	if err := writeAll(h, fat1Offset, firstFATSector); err != nil {
-		return err
+		return fmt.Errorf("writing FAT 1 header: %w", err)
 	}
 	if err := writeAll(h, fat2Offset, firstFATSector); err != nil {
-		return err
+		return fmt.Errorf("writing FAT 2 header: %w", err)
 	}
 
 	if err := zeroRange(h, rootOffset, rootBytes, 91, 94, "Creating root directory..."); err != nil {
@@ -642,24 +665,12 @@ func formatFAT32(opt formatOptions) error {
 		copy(dirSector[:11], l11[:])
 		dirSector[11] = 0x08
 		if err := writeAll(h, rootOffset, dirSector); err != nil {
-			return err
+			return fmt.Errorf("writing volume-label directory entry: %w", err)
 		}
 	}
 
-	// On MBR media, change the partition ID from (for example) NTFS/exFAT 0x07
-	// to FAT32 LBA 0x0C. GPT has no filesystem-specific partition ID to change here.
-	if partitionStyle == 0 { // PARTITION_STYLE_MBR
-		_ = deviceIoControl(h, ioctlDiskSetPartitionInfo, []byte{0x0C}, nil) // best effort
-	}
-
-	fmt.Printf("[ 95%%] Flushing writes...\n")
-	if err := flush(h); err != nil {
-		return err
-	}
-
-	fmt.Printf("[ 97%%] Dismounting formatted volume...\n")
-	if err := deviceIoControl(h, fsctlDismountVolume, nil, nil); err != nil {
-		return fmt.Errorf("cannot dismount formatted volume: %w", err)
+	if partitionStyle == 0 {
+		_ = deviceIoControl(h, ioctlDiskSetPartitionInfo, []byte{0x0C}, nil)
 	}
 
 	fmt.Printf("[ 98%%] Releasing volume...\n")
