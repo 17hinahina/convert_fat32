@@ -1,4 +1,4 @@
-// FAT32 SSD Formatter Console v0.2.1
+// FAT32 SSD Formatter Console v0.2.2
 // Windows x64 console utility. Destructive: formats an existing mounted volume as FAT32.
 package main
 
@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	version = "0.2.1"
+	version = "0.2.2"
 
 	genericRead  = 0x80000000
 	genericWrite = 0x40000000
@@ -170,11 +170,23 @@ func writeAll(h handle, offset uint64, data []byte) error {
 }
 
 func flush(h handle) error {
-	r, _, e := procFlushFileBuffers.Call(uintptr(h))
-	if r == 0 {
-		return winErr("FlushFileBuffers failed", e)
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		r, _, e := procFlushFileBuffers.Call(uintptr(h))
+		if r != 0 {
+			return nil
+		}
+		lastErr = e
+		// ERROR_NOT_READY (21) can be transient with some USB/SATA/NVMe bridges.
+		// Retry only that error; all other flush failures remain fatal.
+		if e != syscall.Errno(21) {
+			return winErr("FlushFileBuffers failed", e)
+		}
+		if attempt < 4 {
+			time.Sleep(250 * time.Millisecond)
+		}
 	}
-	return nil
+	return winErr("FlushFileBuffers failed after retry", lastErr)
 }
 
 func volumePath(letter byte) string { return fmt.Sprintf(`\\.\%c:`, letter) }
@@ -581,12 +593,8 @@ func formatFAT32(opt formatOptions) error {
 	rootOffset := dataOffset
 	rootBytes := uint64(spc) * uint64(bps)
 
-	// Dismount only after all non-destructive queries have completed. From this point onward,
-	// writes go to the raw locked volume and the old filesystem cannot flush over them.
-	if err := deviceIoControl(h, fsctlDismountVolume, nil, nil); err != nil {
-		return fmt.Errorf("cannot dismount locked volume: %w", err)
-	}
-
+	// The volume stays locked but mounted while the raw FAT32 structures are written.
+	// Microsoft documents the sequence as Open -> Lock -> Format -> Dismount -> Unlock -> Close.
 	if err := zeroRange(h, 0, uint64(reservedSectors)*uint64(bps), 3, 6, "Clearing reserved area..."); err != nil {
 		return err
 	}
@@ -638,17 +646,23 @@ func formatFAT32(opt formatOptions) error {
 		}
 	}
 
-	if err := flush(h); err != nil {
-		return err
-	}
-
 	// On MBR media, change the partition ID from (for example) NTFS/exFAT 0x07
 	// to FAT32 LBA 0x0C. GPT has no filesystem-specific partition ID to change here.
 	if partitionStyle == 0 { // PARTITION_STYLE_MBR
 		_ = deviceIoControl(h, ioctlDiskSetPartitionInfo, []byte{0x0C}, nil) // best effort
 	}
 
-	fmt.Printf("[ 97%%] Releasing volume...\n")
+	fmt.Printf("[ 95%%] Flushing writes...\n")
+	if err := flush(h); err != nil {
+		return err
+	}
+
+	fmt.Printf("[ 97%%] Dismounting formatted volume...\n")
+	if err := deviceIoControl(h, fsctlDismountVolume, nil, nil); err != nil {
+		return fmt.Errorf("cannot dismount formatted volume: %w", err)
+	}
+
+	fmt.Printf("[ 98%%] Releasing volume...\n")
 	_ = deviceIoControl(h, fsctlUnlockVolume, nil, nil)
 	locked = false
 	fmt.Printf("[100%%] Completed.\n")
